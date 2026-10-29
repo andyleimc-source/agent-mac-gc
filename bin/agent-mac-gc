@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""agent-mac-gc: Zero-config macOS garbage collector & process reaper for AI Agent / Vibe Coding workloads.
+
+Reclaims leaked MCP stdio processes, ChatGPT/Codex desktop duplicate MCP trees,
+orphan uvx virtualenvs, multi-worktree Xcode DerivedData (with Spotlight .noindex guard),
+and 100GB+ Chrome code_sign_clone leftovers.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fcntl
+import os
+from pathlib import Path
+import plistlib
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+HOME = Path.home()
+ENV = dict(
+    os.environ,
+    PATH=f"{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+)
+VERSION_RE = re.compile(r"/Codex Framework\.framework/Versions/([^/]+)/")
+
+DEFAULT_ORPHAN_TOOL_MARKERS = (
+    "-mcp",
+    "_mcp",
+    "mcp-server",
+    "mcp_server",
+    "@modelcontextprotocol/",
+    "workspace-mcp",
+    "email-mcp",
+    "ms-365-mcp-server",
+    "youtube-uploader-mcp",
+    "activecampaign-mcp",
+    "ga4-mcp-server",
+    "iphone_use.py",
+    "SkyComputerUseClient",
+    "dsh-tui.js",
+)
+
+DEFAULT_CODEX_CHILD_MARKERS = (
+    "-mcp",
+    "_mcp",
+    "mcp-server",
+    "workspace-mcp",
+    "email-mcp",
+    "ms-365-mcp-server",
+    "youtube-uploader-mcp",
+    "activecampaign-mcp",
+    "iphone_use.py",
+    "SkyComputerUseClient",
+    "cua_node",
+)
+
+SESSION_LABEL = "io.github.agent-mac-gc.session"
+DAILY_LABEL = "io.github.agent-mac-gc.daily"
+
+
+def run(args: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=ENV)
+
+
+def age_seconds(value: str) -> int:
+    days, _, clock = value.strip().rpartition("-")
+    fields = [int(x) for x in clock.split(":") if x.isdigit()]
+    seconds = 0
+    for n in fields:
+        seconds = seconds * 60 + n
+    return seconds + (int(days) * 86400 if days and days.isdigit() else 0)
+
+
+def dir_size_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    r = run(["/usr/bin/du", "-sk", str(path)], timeout=30)
+    if r.returncode == 0 and r.stdout.strip():
+        parts = r.stdout.split()
+        if parts and parts[0].isdigit():
+            return int(parts[0]) * 1024
+    return 0
+
+
+def fmt_bytes(num_bytes: int) -> str:
+    val = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0 or unit == "TB":
+            return f"{val:.1f} {unit}" if unit != "B" else f"{int(val)} B"
+        val /= 1024.0
+    return f"{val:.1f} TB"
+
+
+@dataclasses.dataclass
+class Process:
+    pid: int
+    parent: int
+    age: int
+    rss_kb: int
+    command: str
+
+
+def snapshot_processes() -> dict[int, Process]:
+    result: dict[int, Process] = {}
+    out = run(["/bin/ps", "-U", str(os.getuid()), "-ww", "-o", "pid=,ppid=,etime=,rss=,comm="]).stdout
+    for line in out.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) == 5:
+            pid, parent, age, rss, command = fields
+            try:
+                result[int(pid)] = Process(
+                    int(pid), int(parent), age_seconds(age), int(rss), command
+                )
+            except ValueError:
+                continue
+    return result
+
+
+def arguments(pid: int) -> list[str]:
+    out = run(["/bin/ps", "-ww", "-p", str(pid), "-o", "args="]).stdout
+    try:
+        return shlex.split(out)
+    except ValueError:
+        return out.split()
+
+
+def identity(pid: int) -> str:
+    r = run(["/bin/ps", "-ww", "-p", str(pid), "-o", "lstart=,comm="])
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def disconnected_stdio(pid: int) -> bool:
+    lines = run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-d", "0,1", "-F", "ftn"]
+    ).stdout.splitlines()
+    # macOS reports a PIPE with a bare 'n' when the remote peer has closed it.
+    return "tPIPE" in lines and "n" in lines and not any(x.startswith("n->") for x in lines)
+
+
+def is_orphan_stdio_tool(args: list[str], command: str) -> bool:
+    joined = " ".join(args) + " " + command
+    if any(m in joined for m in DEFAULT_ORPHAN_TOOL_MARKERS):
+        return True
+    return "stdio" in args and ("mcp" in joined.lower() or "uvx" in joined or "npx" in joined)
+
+
+def orphan_reason(
+    proc: Process,
+    live_versions: set[str],
+    args: list[str],
+    stdio_closed: bool,
+    dev_server_ttl: int,
+    gradle_ttl: int,
+) -> str | None:
+    if proc.parent != 1 or proc.age < 900:
+        return None
+    if is_orphan_stdio_tool(args, proc.command) and stdio_closed:
+        return "disconnected MCP/stdio tool"
+    joined = " ".join(args)
+    if proc.age >= dev_server_ttl and (
+        "http.server" in joined or "next/dist/bin/next dev" in joined
+    ):
+        return f"orphan temporary dev server (>{dev_server_ttl // 3600}h)"
+    if proc.age >= gradle_ttl and (
+        "GradleDaemon" in joined or "KotlinCompileDaemon" in joined
+    ):
+        return f"idle Gradle/Kotlin build daemon (>{gradle_ttl // 3600}h)"
+    match = VERSION_RE.search(proc.command)
+    if (
+        os.path.basename(proc.command) == "browser_crashpad_handler"
+        and match
+        and live_versions
+        and match[1] not in live_versions
+    ):
+        return "obsolete crashpad helper"
+    return None
+
+
+def stop_tree(
+    root: int,
+    snapshot: dict[int, Process],
+    apply: bool,
+    expected_parent: int = 1,
+    min_age: int = 900,
+) -> tuple[int, int]:
+    """Return (process_count, total_rss_kb)."""
+    targets: list[int] = []
+
+    def visit(pid: int) -> None:
+        for child in snapshot.values():
+            if child.parent == pid:
+                visit(child.pid)
+        targets.append(pid)
+
+    visit(root)
+    rss_kb = sum(snapshot[p].rss_kb for p in targets if p in snapshot)
+    identities = {pid: identity(pid) for pid in targets}
+    if apply:
+        current = snapshot_processes().get(root)
+        if not current or current != snapshot[root]:
+            if (
+                not current
+                or current.parent != expected_parent
+                or current.age < min_age
+                or current.command != snapshot[root].command
+            ):
+                return (0, 0)
+        for pid in targets:
+            if identities[pid] and identity(pid) == identities[pid]:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        time.sleep(0.1)
+    return (len(targets), rss_kb)
+
+
+def run_session_gc(
+    apply: bool,
+    codex_child_ttl: int = 7200,
+    dev_server_ttl: int = 86400,
+    gradle_ttl: int = 7200,
+) -> tuple[int, int, int]:
+    """Reap orphan/stale processes and Chrome code_sign_clone leftovers.
+
+    Returns (reaped_procs, freed_rss_bytes, freed_disk_bytes).
+    """
+    snapshot = snapshot_processes()
+    managed = {
+        int(line.split()[0])
+        for line in run(["/bin/launchctl", "list"]).stdout.splitlines()
+        if line.split() and line.split()[0].isdigit()
+    }
+    versions = {
+        m[1]
+        for p in snapshot.values()
+        if os.path.basename(p.command) != "browser_crashpad_handler"
+        for m in [VERSION_RE.search(p.command)]
+        if m
+    }
+
+    total_procs = 0
+    total_rss_kb = 0
+    verb = "Stopped" if apply else "[dry-run] Would stop"
+
+    # 1. Orphan PPID=1 tools, dev servers, idle Gradle daemons, obsolete crash handlers
+    for p in list(snapshot.values()):
+        if p.parent != 1 or p.age < 900 or p.pid in managed or p.pid == os.getpid():
+            continue
+        args = arguments(p.pid)
+        closed = disconnected_stdio(p.pid) if is_orphan_stdio_tool(args, p.command) else False
+        why = orphan_reason(p, versions, args, closed, dev_server_ttl, gradle_ttl)
+        if why:
+            cnt, rss = stop_tree(p.pid, snapshot, apply, expected_parent=1, min_age=900)
+            if cnt:
+                total_procs += cnt
+                total_rss_kb += rss
+                print(
+                    f"{time.strftime('%F %T')} {verb} PID {p.pid} ({why}): "
+                    f"{cnt} procs, {fmt_bytes(rss * 1024)} RAM"
+                )
+
+    # 2. Stale duplicate MCP/helper subtrees under ChatGPT/Codex app-server
+    snapshot = snapshot_processes()
+    codex_servers = {
+        p.pid
+        for p in snapshot.values()
+        if p.command.endswith("/codex") and "app-server" in arguments(p.pid)
+    }
+    for p in list(snapshot.values()):
+        if p.parent not in codex_servers or p.age < codex_child_ttl:
+            continue
+        args_str = " ".join(arguments(p.pid)) + " " + p.command
+        if any(m in args_str for m in DEFAULT_CODEX_CHILD_MARKERS):
+            cnt, rss = stop_tree(
+                p.pid, snapshot, apply, expected_parent=p.parent, min_age=codex_child_ttl
+            )
+            if cnt:
+                total_procs += cnt
+                total_rss_kb += rss
+                print(
+                    f"{time.strftime('%F %T')} {verb} PID {p.pid} "
+                    f"(stale Codex MCP subtree >{codex_child_ttl // 3600}h): "
+                    f"{cnt} procs, {fmt_bytes(rss * 1024)} RAM"
+                )
+
+    # 3. Stale Chrome code_sign_clone.* bundles in /var/folders/.../X
+    freed_disk = cleanup_chrome_code_sign_clones(apply)
+    return (total_procs, total_rss_kb * 1024, freed_disk)
+
+
+def user_temp_root() -> Path | None:
+    tmpdir = os.environ.get("TMPDIR", "")
+    if not tmpdir:
+        r = run(["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"])
+        tmpdir = r.stdout.strip()
+    return Path(tmpdir).resolve().parent if tmpdir else None
+
+
+def cleanup_chrome_code_sign_clones(apply: bool, min_age_sec: int = 43200) -> int:
+    temp_root = user_temp_root()
+    if not temp_root:
+        return 0
+    clone_root = temp_root / "X/com.google.Chrome.code_sign_clone"
+    if not clone_root.is_dir():
+        return 0
+    now = time.time()
+    candidates = [
+        d
+        for d in clone_root.glob("code_sign_clone.*")
+        if d.is_dir() and (now - d.stat().st_mtime) > min_age_sec
+    ]
+    if not candidates:
+        return 0
+    open_out = run(
+        [
+            "/usr/sbin/lsof",
+            "-F",
+            "n",
+            "-c",
+            "Google Chrome",
+            "-c",
+            "ThemeWidgetControlViewService",
+        ],
+        timeout=20,
+    ).stdout
+    freed = 0
+    verb = "Removed" if apply else "[dry-run] Would remove"
+    for d in candidates:
+        if str(d) in open_out or d.name in open_out:
+            continue
+        sz = dir_size_bytes(d)
+        freed += sz
+        print(f"{time.strftime('%F %T')} {verb} stale Chrome clone {d.name} ({fmt_bytes(sz)})")
+        if apply:
+            shutil.rmtree(d, ignore_errors=True)
+    return freed
+
+
+def is_dir_idle(path: Path, minutes: int) -> bool:
+    r = run(
+        [
+            "/usr/bin/find",
+            str(path),
+            "-maxdepth",
+            "4",
+            "-mmin",
+            f"-{minutes}",
+            "-print",
+            "-quit",
+        ],
+        timeout=15,
+    )
+    return not bool(r.stdout.strip())
+
+
+def active_xcodebuild_running() -> bool:
+    out = run(["/bin/ps", "-axo", "command="]).stdout
+    for line in out.splitlines():
+        if "xcodebuild" in line and "WebDriverAgent" not in line:
+            return True
+    return False
+
+
+def disk_stats_gb() -> tuple[int, int]:
+    """Return (total_gb, free_gb) for /System/Volumes/Data or /."""
+    target = "/System/Volumes/Data" if os.path.exists("/System/Volumes/Data") else "/"
+    st = os.statvfs(target)
+    total_gb = int((st.f_blocks * st.f_frsize) // (1024**3))
+    free_gb = int((st.f_bavail * st.f_frsize) // (1024**3))
+    return (total_gb, free_gb)
+
+
+def ensure_derived_data_noindex(xc_root: Path, apply: bool) -> None:
+    dd = xc_root / "DerivedData"
+    dd_noindex = xc_root / "DerivedData.noindex"
+    if apply:
+        dd_noindex.mkdir(parents=True, exist_ok=True)
+    if dd.is_dir() and not dd.is_symlink():
+        print(
+            f"{time.strftime('%F %T')} "
+            f"{'Migrating' if apply else '[dry-run] Would migrate'} "
+            f"{dd} -> {dd_noindex} (prevents Spotlight mds_stores CPU drain)"
+        )
+        if apply:
+            for item in dd.iterdir():
+                dest = dd_noindex / item.name
+                if not dest.exists():
+                    try:
+                        shutil.move(str(item), str(dest))
+                    except OSError:
+                        shutil.rmtree(item, ignore_errors=True)
+                else:
+                    shutil.rmtree(item, ignore_errors=True)
+            shutil.rmtree(dd, ignore_errors=True)
+            dd.symlink_to("DerivedData.noindex")
+
+
+def workspace_path_from_info_plist(project_dir: Path) -> str | None:
+    plist_file = project_dir / "info.plist"
+    if not plist_file.is_file():
+        return None
+    try:
+        with plist_file.open("rb") as f:
+            data = plistlib.load(f)
+        ws = data.get("WorkspacePath")
+        return str(ws) if ws else None
+    except Exception:
+        return None
+
+
+def run_caches_gc(apply: bool) -> tuple[int, int]:
+    """Clean stale Xcode DerivedData, uv archives, Codex worktrees/releases, Antigravity recordings, and old iOS symbols.
+
+    Returns (removed_dirs_count, freed_bytes).
+    """
+    xc = HOME / "Library/Developer/Xcode"
+    total_gb, free_gb = disk_stats_gb()
+    days = 1 if (total_gb < 1200 or free_gb < 40) else 3
+    removed = 0
+    freed = 0
+    verb = "Removed" if apply else "[dry-run] Would remove"
+
+    def remove_dir(target: Path, why: str) -> None:
+        nonlocal removed, freed
+        sz = dir_size_bytes(target)
+        freed += sz
+        removed += 1
+        print(f"{time.strftime('%F %T')} {verb} {target} ({why}, {fmt_bytes(sz)})")
+        if apply:
+            shutil.rmtree(target, ignore_errors=True)
+
+    # 1. Xcode DerivedData (.noindex symlink + worktree-aware cleanup)
+    if active_xcodebuild_running():
+        print(f"{time.strftime('%F %T')} Active xcodebuild detected, skipping Xcode DerivedData GC")
+    else:
+        ensure_derived_data_noindex(xc, apply)
+        for root in (xc / "DerivedData.noindex", xc / "DerivedData"):
+            if not root.is_dir():
+                continue
+            if root.name == "DerivedData" and root.is_symlink():
+                continue
+            for d in sorted(root.iterdir()):
+                if not d.is_dir() or d.name.endswith(".noindex") or "-" not in d.name:
+                    continue
+                ws = workspace_path_from_info_plist(d)
+                if ws and not os.path.exists(ws):
+                    remove_dir(d, "git worktree / WorkspacePath deleted")
+                elif is_dir_idle(d, days * 1440):
+                    remove_dir(d, f"idle >{days}d")
+
+    # 2. Python uv cache & orphan archive-v0 virtualenvs
+    uv_bin = shutil.which("uv", path=ENV["PATH"])
+    if uv_bin and apply:
+        run([uv_bin, "cache", "prune", "--force"], timeout=120)
+    uv_archive = HOME / ".cache/uv/archive-v0"
+    if uv_archive.is_dir():
+        ps_out = run(["/bin/ps", "-axo", "command="]).stdout
+        active_uv = set(re.findall(r"archive-v0/([^/\s]+)", ps_out))
+        for d in sorted(uv_archive.iterdir()):
+            if not d.is_dir() or d.name in active_uv:
+                continue
+            if is_dir_idle(d, 4320):
+                remove_dir(d, "uv archive-v0 idle >3d")
+
+    # 3. Codex standalone old releases & stale worktrees
+    codex_current = HOME / ".codex/packages/standalone/current"
+    codex_releases = HOME / ".codex/packages/standalone/releases"
+    if codex_current.is_symlink() and codex_releases.is_dir():
+        cur_name = os.path.basename(os.readlink(codex_current))
+        for d in sorted(codex_releases.iterdir()):
+            if d.is_dir() and d.name != cur_name:
+                remove_dir(d, "obsolete Codex standalone release")
+    codex_wt = HOME / ".codex/worktrees"
+    if codex_wt.is_dir():
+        for d in sorted(codex_wt.iterdir()):
+            if d.is_dir() and is_dir_idle(d, 4320):
+                remove_dir(d, "stale Codex worktree >3d")
+
+    # 4. Antigravity / Gemini browser recordings (>3d) & old backups
+    agy_backup = HOME / ".gemini/antigravity-backup"
+    if agy_backup.is_dir():
+        remove_dir(agy_backup, "legacy antigravity-backup")
+    now = time.time()
+    for rec_root in (
+        HOME / ".gemini/antigravity/browser_recordings",
+        HOME / ".gemini/antigravity-ide/browser_recordings",
+    ):
+        if rec_root.is_dir():
+            for d in sorted(rec_root.iterdir()):
+                if (now - d.stat().st_mtime) > 3 * 86400:
+                    if d.is_dir():
+                        remove_dir(d, "Antigravity browser recording >3d")
+                    else:
+                        sz = d.stat().st_size
+                        freed += sz
+                        removed += 1
+                        if apply:
+                            d.unlink(missing_ok=True)
+
+    # 5. Unavailable iOS Simulators & old iOS DeviceSupport symbols (>30d)
+    if apply:
+        run(["/usr/bin/xcrun", "simctl", "delete", "unavailable"], timeout=60)
+    ios_ds = xc / "iOS DeviceSupport"
+    if ios_ds.is_dir():
+        for d in sorted(ios_ds.iterdir()):
+            if d.is_dir() and is_dir_idle(d, 43200):
+                remove_dir(d, "iOS DeviceSupport unused >30d")
+
+    return (removed, freed)
+
+
+def write_launchd_plist(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        plistlib.dump(payload, f)
+
+
+def install_launchd() -> int:
+    script_path = str(Path(__file__).resolve())
+    py_bin = sys.executable
+    agents_dir = HOME / "Library/LaunchAgents"
+    log_dir = HOME / "Library/Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    session_plist = agents_dir / f"{SESSION_LABEL}.plist"
+    daily_plist = agents_dir / f"{DAILY_LABEL}.plist"
+
+    write_launchd_plist(
+        session_plist,
+        {
+            "Label": SESSION_LABEL,
+            "ProcessType": "Background",
+            "ProgramArguments": [py_bin, script_path, "run", "--apply", "--mode", "session"],
+            "RunAtLoad": True,
+            "StartInterval": 900,
+            "StandardOutPath": str(log_dir / "agent-mac-gc.log"),
+            "StandardErrorPath": str(log_dir / "agent-mac-gc.log"),
+        },
+    )
+    write_launchd_plist(
+        daily_plist,
+        {
+            "Label": DAILY_LABEL,
+            "ProcessType": "Background",
+            "ProgramArguments": [py_bin, script_path, "run", "--apply", "--mode", "caches"],
+            "StartCalendarInterval": {"Hour": 4, "Minute": 0},
+            "StandardOutPath": str(log_dir / "agent-mac-gc.log"),
+            "StandardErrorPath": str(log_dir / "agent-mac-gc.log"),
+        },
+    )
+
+    uid = os.getuid()
+    for label, plist in ((SESSION_LABEL, session_plist), (DAILY_LABEL, daily_plist)):
+        run(["/bin/launchctl", "bootout", f"gui/{uid}/{label}"])
+        r = run(["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)])
+        if r.returncode != 0:
+            run(["/bin/launchctl", "load", "-w", str(plist)])
+    print(f"Installed launchd agents:\n  - {session_plist} (every 15m)\n  - {daily_plist} (daily 04:00)")
+    return 0
+
+
+def uninstall_launchd() -> int:
+    agents_dir = HOME / "Library/LaunchAgents"
+    uid = os.getuid()
+    for label in (SESSION_LABEL, DAILY_LABEL):
+        plist = agents_dir / f"{label}.plist"
+        run(["/bin/launchctl", "bootout", f"gui/{uid}/{label}"])
+        if plist.exists():
+            plist.unlink()
+            print(f"Removed {plist}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-mac-gc",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_status = sub.add_parser("status", help="Dry-run audit of reclaimable processes and caches")
+    p_status.add_argument("--mode", choices=("all", "session", "caches"), default="all")
+
+    p_run = sub.add_parser("run", help="Run garbage collection (dry-run unless --apply is passed)")
+    p_run.add_argument("--apply", action="store_true", help="Actually kill processes and delete caches")
+    p_run.add_argument("--mode", choices=("all", "session", "caches"), default="all")
+    p_run.add_argument(
+        "--codex-child-ttl",
+        type=int,
+        default=7200,
+        help="Max age in seconds for Codex app-server MCP child subtrees (default: 7200)",
+    )
+
+    sub.add_parser("install", help="Install 15-minute session reaper & 04:00 daily cache GC LaunchAgents")
+    sub.add_parser("uninstall", help="Unload and remove LaunchAgents")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    opts = parser.parse_args(argv)
+    if sys.platform != "darwin":
+        print("agent-mac-gc only supports macOS (darwin).", file=sys.stderr)
+        return 1
+
+    cmd = opts.cmd or "status"
+    if cmd == "install":
+        return install_launchd()
+    if cmd == "uninstall":
+        return uninstall_launchd()
+
+    apply = bool(getattr(opts, "apply", False)) and cmd == "run"
+    mode = getattr(opts, "mode", "all")
+    codex_ttl = getattr(opts, "codex_child_ttl", 7200)
+
+    lock_dir = HOME / ".cache/agent-mac-gc"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / "gc.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another agent-mac-gc instance is running; exiting.")
+            return 0
+
+        procs = rss_bytes = disk_bytes = dirs_removed = 0
+        if mode in ("all", "session"):
+            p_cnt, p_rss, c_disk = run_session_gc(apply=apply, codex_child_ttl=codex_ttl)
+            procs += p_cnt
+            rss_bytes += p_rss
+            disk_bytes += c_disk
+        if mode in ("all", "caches"):
+            d_cnt, d_disk = run_caches_gc(apply=apply)
+            dirs_removed += d_cnt
+            disk_bytes += d_disk
+
+        prefix = "Summary (applied)" if apply else "Summary (dry-run, pass `run --apply` to execute)"
+        print(
+            f"\n{prefix}: {procs} zombie/stale processes ({fmt_bytes(rss_bytes)} RAM), "
+            f"{dirs_removed} cache directories ({fmt_bytes(disk_bytes)} disk)."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        print(f"{time.strftime('%F %T')} GC incomplete: {type(exc).__name__}", file=sys.stderr)
+        sys.exit(1)
